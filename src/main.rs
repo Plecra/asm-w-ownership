@@ -273,39 +273,45 @@ enum Instruction {
 
     TYA = 0x98,
 }
-#[derive(Default)]
-struct MOS6507<'brand> {
+struct MOS6507<'cpu> {
     // TODO: maybe we should be generic over the devices on the bus? 
-    codegen: CodegenCell<'brand>,
+    status: Status<'cpu>,
+    sp: StackPointer<'cpu>,
+    values: Values<'cpu>,
+    bus: SliceMut<'cpu, 'cpu>,
+}
+impl Default for MOS6507<'_> {
+    fn default() -> Self {
+        Self {
+            status: Default::default(),
+            sp: Default::default(),
+            values: Default::default(),
+            bus: unsafe { core::slice::from_raw_parts_mut(256 as *mut _, u16::MAX as usize) }
+        }
+    }
 }
 
-struct Status<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
+#[derive(Default)]
+struct Status<'cpu>{
+    decimal_mode: DecimalModeFlag<'cpu>,
+    negative: NegativeFlag<'cpu>,
+    overflow: OverflowFlag<'cpu>,
+    zero: ZeroFlag<'cpu>,
+    carry: CarryFlag<'cpu>,
+    interrupt_disable: InterruptDisableFlag<'cpu>,
 }
-struct DecimalModeFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-struct NegativeFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, 'a> NegativeFlag<'brand, 'a> {
-    fn reborrow(&mut self) -> NegativeFlag<'brand, '_> {
-        NegativeFlag { codegen: self.codegen }
-    }
-}
-struct OverflowFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-struct ZeroFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
+#[derive(Default)]
+struct DecimalModeFlag<'cpu>(InvariantLifetime<'cpu>);
+#[derive(Default)]
+struct NegativeFlag<'cpu>(InvariantLifetime<'cpu>);
+#[derive(Default)]
+struct OverflowFlag<'cpu>(InvariantLifetime<'cpu>);
+#[derive(Default)]
+struct ZeroFlag<'cpu>(InvariantLifetime<'cpu>);
 type JumpTarget = (usize, usize);
-impl<'brand, 'a> ZeroFlag<'brand, 'a> {
-    fn reborrow(&mut self) -> ZeroFlag<'brand, '_> {
-        ZeroFlag { codegen: self.codegen }
-    }
-    fn else_jump(&self, code: &mut GhostToken<'brand>, jump_target: JumpTarget) {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+impl<'cpu> ZeroFlag<'cpu> {
+    fn else_jump(&self, code: &mut Controller<'cpu>, jump_target: JumpTarget) {
+        let codegen = &mut code.codegen;
         assert_eq!(codegen.block, jump_target.0);
         let target = jump_target.1;
         let delta = target as i64 - codegen.basic_blocks[codegen.block].len() as i64 - 2;
@@ -313,76 +319,56 @@ impl<'brand, 'a> ZeroFlag<'brand, 'a> {
         codegen.basic_blocks[codegen.block].push(i8::try_from(delta).unwrap() as u8);
     }
 }
-struct CarryFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand> CarryFlag<'brand, '_> {
-    fn set_carry(&mut self, code: &mut GhostToken<'brand>) {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+#[derive(Default)]
+struct CarryFlag<'cpu>(InvariantLifetime<'cpu>);
+impl<'cpu> CarryFlag<'cpu> {
+    fn set_carry(&mut self, code: &mut Controller<'cpu>) {
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::SEC as u8);
     }
-    fn reborrow(&mut self) -> CarryFlag<'brand, '_> {
-        CarryFlag { codegen: self.codegen }
-    }
 }
-struct InterruptDisableFlag<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand> InterruptDisableFlag<'brand, '_> {
-    fn set_interrupt_disable(&mut self, code: &mut GhostToken<'brand>) {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+#[derive(Default)]
+struct InterruptDisableFlag<'cpu>(InvariantLifetime<'cpu>);
+impl<'cpu> InterruptDisableFlag<'cpu> {
+    fn set_interrupt_disable(&mut self, code: &mut Controller<'cpu>) {
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::SEI as u8);
     }
 }
-struct BinaryMathEnabled<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, 'a> BinaryMathEnabled<'brand, 'a> {
-    fn reborrow(&mut self) -> BinaryMathEnabled<'brand, '_> {
-        BinaryMathEnabled { codegen: self.codegen }
-    }
-}
-struct Math<'brand, 'a> {
-    binary_math: BinaryMathEnabled<'brand, 'a>,
-    negative: NegativeFlag<'brand, 'a>,
-    zero: ZeroFlag<'brand, 'a>,
+struct BinaryMathEnabled<'cpu>(InvariantLifetime<'cpu>);
+struct Math<'cpu> {
+    binary_math: BinaryMathEnabled<'cpu>,
+    negative: NegativeFlag<'cpu>,
+    zero: ZeroFlag<'cpu>,
 }
 #[derive(Debug, Clone)]
-enum MemIshOperand<'brand, 'a> {
+enum MemIshOperand<'cpu, 'a> {
     Implied,
-    Accumulator(&'a register::A<'brand, 'a>),
+    Accumulator(&'a register::A<'cpu>),
     Immediate(u8),
-    Deref(ArrayRef<'brand, 'a, 1>),
-    XIndexedDeref(SliceRef<'brand, 'a>, &'a register::X<'brand, 'a>),
-    YIndexedDeref(SliceRef<'brand, 'a>, &'a register::Y<'brand, 'a>),
-    Indirect(ArrayRef<'brand, 'a, 1>),
-    XIndexedIndirectDeref(SliceRef<'brand, 'a>, &'a register::X<'brand, 'a>),
-    IndirectYIndexedDeref(SliceRef<'brand, 'a>, &'a register::Y<'brand, 'a>),
+    Deref(ArrayRef<'cpu, 'a, 1>),
+    XIndexedDeref(SliceRef<'cpu, 'a>, &'a register::X<'cpu>),
+    YIndexedDeref(SliceRef<'cpu, 'a>, &'a register::Y<'cpu>),
+    Indirect(ArrayRef<'cpu, 'a, 1>),
+    XIndexedIndirectDeref(SliceRef<'cpu, 'a>, &'a register::X<'cpu>),
+    IndirectYIndexedDeref(SliceRef<'cpu, 'a>, &'a register::Y<'cpu>),
     
 }
 #[derive(Debug)]
-enum MemIshOperandMut<'brand, 'a> {
+enum MemIshOperandMut<'cpu, 'a> {
     Implied,
-    Accumulator(register::A<'brand, 'a>),
+    Accumulator(&'a mut register::A<'cpu>),
     Immediate(u8),
-    Deref(ArrayMut<'brand, 'a, 1>),
-    XIndexedDeref(SliceMut<'brand, 'a>, &'a register::X<'brand, 'a>),
-    YIndexedDeref(SliceMut<'brand, 'a>, &'a register::Y<'brand, 'a>),
-    Indirect(ArrayMut<'brand, 'a, 1>),
-    XIndexedIndirectDeref(SliceMut<'brand, 'a>, &'a register::X<'brand, 'a>),
-    IndirectYIndexedDeref(SliceMut<'brand, 'a>, &'a register::Y<'brand, 'a>),
+    Deref(ArrayMut<'cpu, 'a, 1>),
+    XIndexedDeref(SliceMut<'cpu, 'a>, &'a register::X<'cpu>),
+    YIndexedDeref(SliceMut<'cpu, 'a>, &'a register::Y<'cpu>),
+    Indirect(ArrayMut<'cpu, 'a, 1>),
+    XIndexedIndirectDeref(SliceMut<'cpu, 'a>, &'a register::X<'cpu>),
+    IndirectYIndexedDeref(SliceMut<'cpu, 'a>, &'a register::Y<'cpu>),
     
 }
-#[derive(Debug, Clone)]
-struct ArrayRef<'brand, 'a, const LEN: usize> {
-    range_start: u16,
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, const LEN: usize> ArrayRef<'brand, '_, LEN> {
-    fn addr(&self) -> u16 {
-        self.range_start
-    }
-}
+type ArrayRef<'cpu, 'a, const LEN: usize> = &'a Array<'cpu, LEN>;
+type ArrayMut<'cpu, 'a, const LEN: usize> = &'a mut Array<'cpu, LEN>;
 #[derive(Debug, Clone)]
 struct SliceRef<'brand, 'a> {
     range_start: u16,
@@ -394,19 +380,24 @@ impl<'brand> SliceRef<'brand, '_> {
         self.range_start
     }
 }
-impl<'brand, 'a> Math<'brand, 'a> {
-    fn init(code: CodegenCursor<'brand, '_>, decimal_mode: DecimalModeFlag<'brand, 'a>, negative: NegativeFlag<'brand, 'a>, zero: ZeroFlag<'brand, 'a>) -> Self {
-        Self {
-            binary_math: decimal_mode.clear_decimal_flag(code),
-            negative,
-            zero
+trait Address {
+    fn addr(&self) -> u16;
+}
+impl Address for Slice<'_> {
+    fn addr(&self) -> u16 {
+        (self.as_ptr() as usize).checked_sub(256).unwrap() as u16
+    }
+}
+impl<'cpu> Math<'cpu> {
+    fn init<'a>(code: &mut Controller<'cpu>, math_mode: &'a mut DecimalModeFlag<'cpu>, negative: &'a mut NegativeFlag<'cpu>, zero: &'a mut ZeroFlag<'cpu>) -> &'a mut Self {
+        let binary_mode: &'a mut BinaryMathEnabled<'cpu> = math_mode.clear_decimal_flag(code);
+        
+        unsafe {
+            &mut *(binary_mode as *mut _ as *mut Self)
         }
     }
-    fn reborrow(&mut self) -> Math<'brand, '_> {
-        Math { binary_math: self.binary_math.reborrow(), negative: self.negative.reborrow(), zero: self.zero.reborrow() }
-    }
-    fn add_with_carry(&mut self, code: &mut GhostToken<'brand>, _: CarryFlag<'brand, '_>, operand: MemIshOperand<'brand, '_>) {
-        let codegen = self.binary_math.codegen.codegen.borrow_mut(code);
+    fn add_with_carry(&mut self, code: &mut Controller<'cpu>, _: &mut CarryFlag<'cpu>, operand: MemIshOperand<'cpu, '_>) {
+        let codegen = &mut code.codegen;
         match operand {
             MemIshOperand::Immediate(imm) => {
                 codegen.basic_blocks[codegen.block].push(Instruction::ADC_IMM as u8);
@@ -450,164 +441,69 @@ impl<'brand, 'a> Math<'brand, 'a> {
         
     }
 }
-impl<'brand, 'a> DecimalModeFlag<'brand, 'a> {
-    fn set_decimal_flag<'c>(self, code: &mut GhostToken<'brand>) {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+impl<'cpu> DecimalModeFlag<'cpu> {
+    fn set_decimal_flag(&mut self, code: &mut Controller<'cpu>) {
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::SEC as u8);
     }
-    fn clear_decimal_flag<'c>(self, code: &mut GhostToken<'brand>) -> BinaryMathEnabled<'brand, 'c> where 'a: 'c {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+    fn clear_decimal_flag(&mut self, code: &mut Controller<'cpu>) -> &mut BinaryMathEnabled<'cpu> {
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::CLD as u8);
-        BinaryMathEnabled { codegen: self.codegen }
-    }
-    fn reborrow(&mut self) -> DecimalModeFlag<'brand, '_> {
-        DecimalModeFlag { codegen: self.codegen }
-    }
-}
-impl<'brand> Status<'brand, '_> {
-    fn as_mut_parts(&mut self) -> (DecimalModeFlag<'brand, '_>, NegativeFlag<'brand, '_>, OverflowFlag<'brand, '_>, ZeroFlag<'brand, '_>, CarryFlag<'brand, '_>, InterruptDisableFlag<'brand, '_>) {
-        let decimal_mode = DecimalModeFlag { codegen: &self.codegen };
-        let negative = NegativeFlag { codegen: &self.codegen };
-        let overflow = OverflowFlag { codegen: &self.codegen };
-        let zero = ZeroFlag { codegen: &self.codegen };
-        let carry = CarryFlag { codegen: &self.codegen };
-        let interrupt_disable = InterruptDisableFlag { codegen: &self.codegen };
 
-        (decimal_mode, negative, overflow, zero, carry, interrupt_disable)
+        unsafe {
+            &mut *core::ptr::null_mut()
+        }
     }
 }
-#[derive(Debug)]
-struct SliceMut<'brand, 'a> {
-    range_start: u16,
-    range_end: u16,
-
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, 'a> SliceMut<'brand, 'a> {
-    fn as_ref(&self) -> SliceRef<'brand, '_> {
-        SliceRef { range_start: self.range_start, range_end: self.range_end, codegen: self.codegen }
-    }
-    fn addr(&self) -> u16 {
-        self.as_ref().addr()
-    }
-    fn len(&self) -> u16 {
-        (self.range_end + 1).saturating_sub(self.range_start)
-    }
-    fn to_array<const LEN: usize>(self) -> ArrayMut<'brand, 'a, LEN> {
-        assert!(self.range_start.checked_add(LEN.try_into().unwrap()).unwrap() <= self.range_end);
-        ArrayMut { range_start: self.range_start, codegen: self.codegen }
-    }
-    fn split_at_mut(self, at: u16) -> (SliceMut<'brand, 'a>, SliceMut<'brand, 'a>) {
-        assert!(at >= self.range_start);
-        assert!(at <= self.range_end);
-        (SliceMut { range_start: self.range_start, range_end: at - 1, codegen: self.codegen }, SliceMut { range_start: at, range_end: self.range_end, codegen: self.codegen })
-    }
-    fn suffix(self, start: u16) -> SliceMut<'brand, 'a> {
-        let end = self.range_end;
-        self.reslice(start, end)
-    }
-    fn prefix(self, end: u16) -> SliceMut<'brand, 'a> {
-        let start = self.range_start;
-        self.reslice(start, end)
-    }
-    fn reslice(self, start: u16, end: u16) -> SliceMut<'brand, 'a> {
-        assert!(start >= self.range_start);
-        assert!(end <= self.range_end);
-        SliceMut { range_start: start, range_end: end, codegen: self.codegen }
-    }
-    fn subslice(self, subrange: impl core::ops::RangeBounds<u16>) -> SliceMut<'brand, 'a> {
-        let range_start = match subrange.start_bound() {
-            core::ops::Bound::Included(start) => *start + self.range_start,
-            core::ops::Bound::Excluded(start) => start + 1 + self.range_start,
-            core::ops::Bound::Unbounded => self.range_start,
-        };
-        let range_end = match subrange.end_bound() {
-            core::ops::Bound::Included(end) => self.range_start + *end,
-            core::ops::Bound::Excluded(end) => self.range_start + *end - 1,
-            core::ops::Bound::Unbounded => self.range_end,
-        };
-        self.reslice(range_start, range_end)
-    }
-    fn reborrow(&mut self) -> SliceMut<'brand, '_> {
-        SliceMut { range_start: self.range_start, range_end: self.range_end, codegen: self.codegen }
-    }
-}
-impl<'brand> MOS6507<'brand> {
-    fn as_mut_parts(&mut self) -> ((Status<'brand, '_>, ProgramCounter<'brand, '_>, StackPointer<'brand, '_>, Values<'brand, '_>), SliceMut<'brand, '_>) {
-        let status = Status { codegen: &self.codegen };
-        let pc = ProgramCounter { codegen: &self.codegen };
-        let stack = StackPointer { codegen: &self.codegen };
-        let values = Values { codegen: &self.codegen };
-        let registers = (status, pc, stack, values);
-        (registers, SliceMut { range_start: 0, range_end: u16::MAX, codegen: &self.codegen })
-    }
-}
-struct ProgramCounter<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-struct StackPointer<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
+type Slice<'cpu> = [MemoryLocation<'cpu>];
+type SliceMut<'cpu, 'a> = &'a mut Slice<'cpu>;
+#[derive(Default)]
+struct StackPointer<'cpu>(InvariantLifetime<'cpu>);
 struct Stack<'brand, 'a> {
     stack: SliceMut<'brand, 'a>,
 }
-impl<'brand, 'a> StackPointer<'brand, 'a> {
-    fn init_stack<'b>(self, code: &mut GhostToken<'brand>, stack: SliceMut<'brand, 'b>, mut x: register::X<'brand, '_>) -> Stack<'brand, 'b> {
-        assert!(stack.range_start <= stack.range_end);
-        assert!(stack.range_start <= 256);
-        x.load(code, stack.range_end.min(256) as u8);
-        let codegen = self.codegen.codegen.borrow_mut(code);
+impl<'cpu> StackPointer<'cpu> {
+    fn init_stack<'a>(&mut self, code: &mut Controller<'cpu>, stack: &'a mut Slice<'cpu>, x: &mut register::X<'cpu>) -> Stack<'cpu, 'a> {
+        let addr = stack.addr();
+        let end = addr + stack.len() as u16 - 1;
+        assert!(addr <= 256);
+        x.load(code, end.min(255) as u8);
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::TXS as u8);
         Stack { stack }
     }
-    fn reborrow(&mut self) -> StackPointer<'brand, '_> {
-        StackPointer { codegen: self.codegen }
-    }
 }
-struct Values<'brand, 'a> {
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, 'a> Values<'brand, 'a> {
-    fn reborrow(&mut self) -> Values<'brand, '_> {
-        Values { codegen: self.codegen }
-    }
+#[derive(Default)]
+struct Values<'cpu> {
+    a: register::A<'cpu>,
+    x: register::X<'cpu>,
+    y: register::Y<'cpu>,
 }
 trait AsCodegen<'cpu> {
     fn as_codegen(&self) -> &CodegenCell<'cpu>;
 }
 mod register {
-    impl<'brand, 'a> Values<'brand, 'a> {
-        pub fn split(self) -> (register::A<'brand, 'a>, register::X<'brand, 'a>, register::Y<'brand, 'a>) {
-            (register::A { codegen: self.codegen }, register::X { codegen: self.codegen }, register::Y { codegen: self.codegen })
-        }
-    }
     use super::*;
-    impl core::fmt::Debug for A<'_, '_> {
+    impl core::fmt::Debug for A<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("A").finish()
         }
     }
-    impl core::fmt::Debug for X<'_, '_> {
+    impl core::fmt::Debug for X<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("X").finish()
         }
     }
-    impl core::fmt::Debug for Y<'_, '_> {
+    impl core::fmt::Debug for Y<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("Y").finish()
         }
     }
-    pub struct A<'cpu, 'a> {
-        codegen: &'a CodegenCell<'cpu>,
-    }
-    impl<'cpu> AsRef<CodegenCell<'cpu>> for A<'cpu, '_> {
-        fn as_ref(&self) -> &CodegenCell<'cpu> {
-            self.codegen
-        }
-    }
-    impl<'cpu, 'a> A<'cpu, 'a> {
-        pub fn load(&mut self, code: &mut GhostToken<'cpu>, operand: MemIshOperand<'cpu, '_>) {
-            let codegen = self.codegen.codegen.borrow_mut(code);
+    #[derive(Default)]
+    pub struct A<'cpu>(InvariantLifetime<'cpu>);
+    impl<'cpu> A<'cpu> {
+        pub fn load(&mut self, code: &mut Controller<'cpu>, operand: MemIshOperand<'cpu, '_>) {
+            let codegen = &mut code.codegen;
             match operand {
                 MemIshOperand::Immediate(imm) => {
                     codegen.basic_blocks[codegen.block].push(Instruction::LDA_IMM as u8);
@@ -648,9 +544,9 @@ mod register {
                 unknown => unimplemented!("operand {unknown:?} not supported for LDA"),
             }
         }
-        pub fn store(&self, code: &mut GhostToken<'cpu>, operand: MemIshOperandMut<'cpu, '_>) {
-            let codegen = self.codegen.codegen.borrow_mut(code);
-            match operand {
+        pub fn store<'a>(&self, code: &mut Controller<'cpu>, operand: impl Into<MemIshOperandMut<'cpu, 'a>>) where 'cpu: 'a {
+            let codegen = &mut code.codegen;
+            match operand.into() {
                 MemIshOperandMut::Deref(var) if var.addr() < 256 => {
                     codegen.basic_blocks[codegen.block].push(Instruction::STA_ZP as u8);
                     codegen.basic_blocks[codegen.block].push(var.addr() as u8);
@@ -682,27 +578,26 @@ mod register {
                     codegen.basic_blocks[codegen.block].push(Instruction::STA_INDY as u8);
                     codegen.basic_blocks[codegen.block].push(var.addr().try_into().unwrap());
                 }
-                _ => unimplemented!("operand {operand:?} not supported for LDA"),
+                unknown => unimplemented!("operand {unknown:?} not supported for LDA"),
     
             
             }
         }
     }
-    pub struct X<'cpu, 'a> {
-        codegen: &'a CodegenCell<'cpu>,
-    }
-    impl<'cpu, 'a> X<'cpu, 'a> {
-        pub fn decrement(&mut self, code: &mut GhostToken<'cpu>, math: Math<'cpu, '_>) {
-            let codegen = self.codegen.codegen.borrow_mut(code);
+    #[derive(Default)]
+    pub struct X<'cpu>(InvariantLifetime<'cpu>);
+    impl<'cpu> X<'cpu> {
+        pub fn decrement(&mut self, code: &mut Controller<'cpu>, math: &mut Math<'cpu>) {
+            let codegen = &mut code.codegen;
             codegen.basic_blocks[codegen.block].push(Instruction::DEX as u8);
         }
-        pub fn load(&mut self, code: &mut GhostToken<'cpu>, value: u8) {
-            let codegen = self.codegen.codegen.borrow_mut(code);
+        pub fn load(&mut self, code: &mut Controller<'cpu>, value: u8) {
+            let codegen = &mut code.codegen;
             codegen.basic_blocks[codegen.block].push(Instruction::LDX_IMM as u8);
             codegen.basic_blocks[codegen.block].push(value);
         }
-        pub fn store(&self, code: &mut GhostToken<'cpu>, operand: MemIshOperand<'cpu, '_>) {
-            let codegen = self.codegen.codegen.borrow_mut(code);
+        pub fn store(&self, code: &mut Controller<'cpu>, operand: MemIshOperand<'cpu, '_>) {
+            let codegen = &mut code.codegen;
             match operand {
                 MemIshOperand::Immediate(imm) => {
                     codegen.basic_blocks[codegen.block].push(Instruction::LDX_IMM as u8);
@@ -728,19 +623,17 @@ mod register {
             }
         }
     }
-    pub struct Y<'cpu, 'a> {
-        codegen: &'a CodegenCell<'cpu>,
-    
-    }
+    #[derive(Default)]
+    pub struct Y<'cpu>(InvariantLifetime<'cpu>);
 }
-impl<'brand, 'a> Values<'brand, 'a> {
-    fn store_constant(&mut self, code: &mut GhostToken<'brand>, place: ArrayMut<'brand, '_, 1>, value: u8) {
-        let codegen = self.codegen.codegen.borrow_mut(code);
+impl<'cpu> Values<'cpu> {
+    fn store_constant(&mut self, code: &mut Controller<'cpu>, place: ArrayMut<'cpu, '_, 1>, value: u8) {
+        let codegen = &mut code.codegen;
         codegen.basic_blocks[codegen.block].push(Instruction::LDA_IMM as u8);
         codegen.basic_blocks[codegen.block].push(value);
         codegen.basic_blocks[codegen.block].push(Instruction::STA_ABS as u8);
-        codegen.basic_blocks[codegen.block].push(place.range_start as u8);
-        codegen.basic_blocks[codegen.block].push((place.range_start >> 8) as u8);
+        codegen.basic_blocks[codegen.block].push(place.addr() as u8);
+        codegen.basic_blocks[codegen.block].push((place.addr() >> 8) as u8);
     }
 }
 #[derive(Default)]
@@ -756,56 +649,61 @@ struct Codegen {
     basic_blocks: Vec<Vec<u8>>,
     block: usize,
 }
-#[derive(Debug)]
-struct ArrayMut<'brand, 'a, const LEN: usize> {
-    range_start: u16,
-    
-    codegen: &'a CodegenCell<'brand>,
-}
-impl<'brand, 'a, const LEN: usize> ArrayMut<'brand, 'a, LEN> {
-    fn addr(&self) -> u16 {
-        self.as_ref().addr()
+// Represents the address 256 smaller than the location it's "at"
+struct MemoryLocation<'cpu>(InvariantLifetime<'cpu>);
+impl core::fmt::Debug for MemoryLocation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"({})", self as *const _ as usize - 256)
     }
-    fn as_ref(&self) -> ArrayRef<'brand, '_, LEN> {
-        ArrayRef { range_start: self.range_start, codegen: self.codegen }
-    }
-
 }
+type Array<'cpu, const LEN: usize> = [MemoryLocation<'cpu>; LEN];
 #[derive(Debug)]
-struct R6532<'brand, 'a> {
+struct R6532<'cpu, 'a> {
     // The location of the R6532 in the bus
     location: u16,
-    mem: SliceMut<'brand, 'a>,
+    mem: SliceMut<'cpu, 'a>,
 }
-impl<'brand, 'a> R6532<'brand, 'a> {
-    fn reborrow(&mut self) -> R6532<'brand, '_> {
-        R6532 { location: self.location, mem: self.mem.reborrow() }
+fn zst_split_at_mut<T>(a: &mut [T], mid: usize) -> (&mut [T], &mut [T]) {
+    assert!(mid <= a.len());
+    let len = a.len();
+    let ptr = a.as_mut_ptr();
+
+    unsafe {
+        (std::slice::from_raw_parts_mut(a.as_mut_ptr(), mid), 
+        std::slice::from_raw_parts_mut(ptr.cast::<u8>().add(mid).cast::<T>(), len - mid))
     }
-    fn split(self, at: u16) -> (R6532<'brand, 'a>, R6532<'brand, 'a>) {
-        let (left, right) = self.mem.split_at_mut(at);
+}
+impl<'cpu, 'a> R6532<'cpu, 'a> {
+    fn reborrow(&mut self) -> R6532<'cpu, '_> {
+        R6532 { location: self.location, mem: &mut self.mem[..] }
+    }
+    fn split(self, at: u16) -> (R6532<'cpu, 'a>, R6532<'cpu, 'a>) {
+        let (left, right) = zst_split_at_mut(self.mem, at as usize);
         (R6532 { location: self.location, mem: left }, R6532 { location: self.location, mem: right })
     }
-    fn mem(self) -> SliceMut<'brand, 'a> {
-        let start = self.mem.range_start.max(self.location);
-        let end = self.mem.range_end.min(self.location + 128);
-        self.mem.reslice(start, end)
+    fn mem(self) -> SliceMut<'cpu, 'a> {
+        let start = self.location.checked_sub(self.mem.addr()).unwrap() as usize;
+        let len = 128.min(self.mem.len()) as usize;
+        
+        &mut self.mem[start..start + len]
     }
-    fn at<const LEN: usize>(self, pos: u16) -> ArrayMut<'brand, 'a, LEN> {
-        self.mem.suffix(self.location + pos).to_array()
+    fn at<const LEN: usize>(self, pos: u16) -> ArrayMut<'cpu, 'a, LEN> {
+        let offset = (self.location + pos).checked_sub(self.mem.addr()).unwrap() as usize;
+        (&mut self.mem[offset..offset + LEN]).try_into().unwrap()
     }
-    fn DRA(self) -> ArrayMut<'brand, 'a, 1> {
+    fn DRA(self) -> ArrayMut<'cpu, 'a, 1> {
         self.at(128 + 0)
     }
-    fn DDRA(self) -> ArrayMut<'brand, 'a, 1> {
+    fn DDRA(self) -> ArrayMut<'cpu, 'a, 1> {
         self.at(128 + 1)
     }
-    fn DRB(self) -> ArrayMut<'brand, 'a, 1> {
+    fn DRB(self) -> ArrayMut<'cpu, 'a, 1> {
         self.at(128 + 2)
     }
-    fn DDRB(self) -> ArrayMut<'brand, 'a, 1> {
+    fn DDRB(self) -> ArrayMut<'cpu, 'a, 1> {
         self.at(128 + 3)
     }
-    fn timer(self, enable_interrupt: bool, eights_exponent: u8) -> ArrayMut<'brand, 'a, 1> {
+    fn timer(self, enable_interrupt: bool, eights_exponent: u8) -> ArrayMut<'cpu, 'a, 1> {
         self.at(128 + 0x14 + (enable_interrupt as u16 * 8) + eights_exponent as u16)
     }
 }
@@ -859,42 +757,60 @@ impl<'cpu, 'a> CodegenCursorExt<'cpu, 'a> for CodegenCursor<'cpu, 'a> {
         (codegen.block, target)
     }
 }
-fn fill<'cpu>(code: CodegenCursor<'cpu, '_>, mut slice: SliceMut<'cpu, '_>, values: Values<'cpu, '_>, mut math: Math<'cpu, '_>) {
-    let (mut a, mut x,y) = values.split();
-    x.load(code, (slice.len() - 1).try_into().unwrap());
-    a.load(code, MemIshOperand::Immediate(0));
-    let clearzp = code.get_jump_target(&a);
-    a.store(code, MemIshOperandMut::XIndexedDeref(slice.reborrow(), &x));
-    x.decrement(code, math.reborrow());
-    math.zero.else_jump(code, clearzp);
-    a.store(code, MemIshOperandMut::XIndexedDeref(slice.reborrow(), &x));
+fn increment<'cpu>(code: &mut Controller<'cpu>, operand: MemIshOperandMut<'cpu, '_>) {
 
 }
-impl<'cpu> AsRef<CodegenCell<'cpu>> for SliceMut<'cpu, '_> {
-    fn as_ref(&self) -> &CodegenCell<'cpu> {
-        self.codegen
+struct Controller<'cpu> {
+    marker: InvariantLifetime<'cpu>,
+    codegen: Codegen,
+}
+impl<'cpu> Controller<'cpu> {
+    fn get_jump_target(&self) -> (usize, usize) {
+        let target = self.codegen.basic_blocks[self.codegen.block].len();
+        (self.codegen.block, target)
     }
 }
-fn increment<'cpu>(code: CodegenCursor<'cpu, '_>, operand: MemIshOperandMut<'cpu, '_>) {
+type InvariantLifetime<'brand> = core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>;
+trait SliceExt<'cpu> {
+    fn idx<'a, T>(&'a mut self, index: &'a T) -> MemIshOperandMut<'cpu, 'a> where T: BuildOperand<'cpu>;
+}
+trait BuildOperand<'cpu> {
+    fn index_slice<'a>(&'a self, slice: SliceMut<'cpu, 'a>) -> MemIshOperandMut<'cpu, 'a>;
+}
+impl<'cpu> BuildOperand<'cpu> for register::X<'cpu> {
+    fn index_slice<'a>(&'a self, slice: SliceMut<'cpu, 'a>) -> MemIshOperandMut<'cpu, 'a> {
+        MemIshOperandMut::XIndexedDeref(slice, self)
+    }
 
 }
-fn reset<'a>(code: &mut GhostToken<'a>, cpu: &mut MOS6507<'a>) {
-    let (registers, bus) = cpu.as_mut_parts();
-    let (mut status, _, sp, mut values) = registers;
-    let (decimal_mode, n, _, z, _, mut interrupt_disable) = status.as_mut_parts();
-    let math = Math::init(code, decimal_mode, n, z);
-    interrupt_disable.set_interrupt_disable(code);
-    
-    let (mem, mut io) = R6532 { location: 0, mem: bus.subslice(0..0x100) }.split(0x80);
-    let mut mem = mem.mem();
-    
-    let _stack = sp.init_stack(code, mem.reborrow(), values.reborrow().split().1);// cpu.set_stack_pointer(heap.(end-1))
-    fill(code, mem.reborrow(), values.reborrow(), math);
-    // values.store_constant(code, io.reborrow().DDRA(), 0x00);
-    values.store_constant(code, io.reborrow().DDRB(), 0xFF);
+impl<'cpu> SliceExt<'cpu> for [MemoryLocation<'cpu>] {
+    fn idx<'a, T>(&'a mut self, index: &'a T) -> MemIshOperandMut<'cpu, 'a> where T: BuildOperand<'cpu> {
+        index.index_slice(self)
+    }
+}
+fn fill<'cpu>(code: &mut Controller<'cpu>, slice: SliceMut<'cpu, '_>, Values {a, x, .. }: &mut Values<'cpu>, math: &mut Math<'cpu>) {
+    x.load(code, (slice.len() - 1).try_into().unwrap());
+    a.load(code, MemIshOperand::Immediate(0));
+    let clearzp = code.get_jump_target();
+        a.store(code, slice.idx(x));
+        x.decrement(code, math);
+        math.zero.else_jump(code, clearzp);
+    a.store(code, slice.idx(x));
+}
+fn reset<'cpu>(c: &mut Controller<'cpu>, MOS6507 { status: Status { decimal_mode: D, negative: N, zero: Z, interrupt_disable: I, .. }, sp, values, bus }: &mut MOS6507<'cpu>) {
+    let (mem, mut io) = R6532 { location: 0, mem: &mut bus[..0x100] }.split(0x80);
+    let mem = mem.mem();
 
-    let main = code.get_jump_target(mem);
-    increment(code, MemIshOperandMut::Deref(io.reborrow().DRB()));
+    let math = Math::init(c, D, N, Z);
+    I.set_interrupt_disable(c);
+    
+    sp.init_stack(c, mem, &mut values.x);
+    fill(c, mem, values, math);
+    // values.store_constant(code, io.reborrow().DDRA(), 0x00);
+    values.store_constant(c, io.reborrow().DDRB(), 0xFF);
+
+    let main = c.get_jump_target();
+    // increment(code, MemIshOperandMut::Deref(io.reborrow().DRB()));
 
     // loop {
     //     cpu.inc(riot.DRB)
@@ -903,7 +819,6 @@ fn reset<'a>(code: &mut GhostToken<'a>, cpu: &mut MOS6507<'a>) {
     //     riot.timer(.interrupt_off, eights_exponent) := 244
         
     //     cpu.while_(|| riot.timer(.interrupt_off).* != 0, || {})
-    // }
     // }
 }
 enum AsmOperand {
@@ -1095,12 +1010,12 @@ fn decode_block(insrs: &[u8]) -> impl Iterator<Item = (Instruction, AsmOperand)>
     }))
 }
 fn main() {
-    let out = GhostToken::new(|mut token| {
+    let out = {
         let mut target = MOS6507::default();
-
-        reset(&mut token, &mut target);
-        target.codegen.codegen.into_inner()
-    });
+        let mut code = Controller { marker: InvariantLifetime::default(), codegen: Codegen::new() };
+        reset(&mut code, &mut target);
+        code.codegen
+    };
     for block in &out.basic_blocks {
         for (insr, op) in decode_block(block) {
             println!("  {} {op:?}", insr.mnemonic());
